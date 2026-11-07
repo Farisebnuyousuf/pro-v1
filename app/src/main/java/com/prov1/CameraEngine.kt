@@ -757,10 +757,12 @@ class CameraEngine(
     @Suppress("DEPRECATION")
     private fun createRecorder(hintDeg: Int): MediaRecorder {
         val rec = MediaRecorder() // legacy ctor: works on every Android for minSdk 26
+        // MediaRecorder's state machine requires the audio source first;
+        // setVideoSource before it throws "invalid state(4)" on this HAL.
+        if (audioOn) rec.setAudioSource(MediaRecorder.AudioSource.MIC)
         rec.setVideoSource(MediaRecorder.VideoSource.SURFACE)
         rec.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
         if (audioOn) {
-            rec.setAudioSource(MediaRecorder.AudioSource.MIC)
             rec.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
             rec.setAudioEncodingBitRate(128_000)
             rec.setAudioSamplingRate(44_100)

@@ -260,6 +260,8 @@ class MainActivity : Activity() {
         engine = CameraEngine(this) { msg ->
             runOnUiThread {
                 statusView.text = msg
+                if (msg.startsWith("REC —")) setRecordBtnRecording()
+                else setRecordBtnIdle()
                 syncPanel()
                 updateChipLabels()
             }
