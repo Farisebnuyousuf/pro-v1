@@ -83,6 +83,19 @@ class CameraEngine(
     private var evComp = 0
     private var transformMatrix: Matrix? = null
 
+    // ---- M4 quality & motion state ----
+    private var fpsRanges: List<Range<Int>>? = null
+    private var fpsLock = 0 // 0 = auto/unlocked
+    private var zoomMax = 1f
+    private var zoomRatio = 1f
+    private var eisSupported = false
+    private var oisSupported = false
+    private var eisOn = true
+    private var oisOn = true
+    private var audioOn = true
+    private var bitrateMbps = 12
+    private var recordingFps = 30
+
     // ---- active session request bookkeeping ----
     private var activeTemplate = 0
     private var activeTargets: List<Surface>? = null
@@ -296,6 +309,59 @@ class CameraEngine(
         return true
     }
 
+    // ---------- M4: quality & motion API ----------
+
+    data class QualityCaps(
+        val fpsOptions: List<Int>,
+        val zoomMax: Float,
+        val eisSupported: Boolean,
+        val oisSupported: Boolean
+    )
+
+    fun qualityCaps(): QualityCaps? {
+        if (cameraId == null) return null
+        val exact = fpsRanges
+            ?.filter { it.lower == it.upper }
+            ?.map { it.upper }
+            ?.distinct()
+            ?.sorted()
+            ?: emptyList()
+        return QualityCaps(exact, zoomMax, eisSupported, oisSupported)
+    }
+
+    fun fpsLockVal(): Int = fpsLock
+    fun isEisOn(): Boolean = eisOn && eisSupported
+    fun isOisOn(): Boolean = oisOn && oisSupported
+    fun isAudioOn(): Boolean = audioOn
+
+    fun setFpsLock(v: Int) {
+        fpsLock = v
+        refreshRepeatingRequest()
+    }
+
+    fun setZoom(ratio: Float) {
+        zoomRatio = ratio.coerceIn(1f, zoomMax)
+        refreshRepeatingRequest()
+    }
+
+    fun setEisOn(on: Boolean) {
+        eisOn = on
+        refreshRepeatingRequest()
+    }
+
+    fun setOisOn(on: Boolean) {
+        oisOn = on
+        refreshRepeatingRequest()
+    }
+
+    fun setAudioOn(on: Boolean) {
+        audioOn = on
+    }
+
+    fun setBitrateMbps(mb: Int) {
+        bitrateMbps = mb.coerceIn(4, 60)
+    }
+
     // ---------- camera open / preview ----------
 
     private fun open() {
@@ -380,6 +446,14 @@ class CameraEngine(
         if (st != null && st.denominator > 0 && st.numerator > 0) {
             evStep = st.numerator.toFloat() / st.denominator
         }
+        fpsRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?.toList()
+        val zr = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+        zoomMax = zr?.upper ?: 1f
+        eisSupported = chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
+            ?.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON) == true
+        oisSupported = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+            ?.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON) == true
     }
 
     private fun streamMap(): StreamConfigurationMap {
@@ -414,8 +488,9 @@ class CameraEngine(
             }
             exposureRange?.let { r ->
                 var ns = manualShutterNs ?: 16_666_667L
-                // Recording constrains exposure to at most ~1/30s for stable fps.
-                if (activeWithRecorder && ns > 33_000_000L) ns = 33_000_000L
+                // Recording constrains exposure to at most one frame period.
+                val maxNs = 1_100_000_000L / recordingFps
+                if (activeWithRecorder && ns > maxNs) ns = maxNs
                 b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, ns.coerceIn(r.lower, r.upper))
             }
             manualFocusD?.let { fd ->
@@ -446,6 +521,27 @@ class CameraEngine(
             )
             if (aeLocked) b.set(CaptureRequest.CONTROL_AE_LOCK, true)
             if (evComp != 0) b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, evComp)
+        }
+        if (fpsLock > 0) {
+            fpsRanges?.firstOrNull { it.lower == fpsLock && it.upper == fpsLock }
+                ?.let { b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
+        }
+        if (zoomMax > 1f) {
+            b.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio.coerceIn(1f, zoomMax))
+        }
+        if (eisSupported) {
+            b.set(
+                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                if (eisOn) CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                else CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+            )
+        }
+        if (oisSupported) {
+            b.set(
+                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                if (oisOn) CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
+                else CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF
+            )
         }
         meterRegions?.let { rs ->
             b.set(CaptureRequest.CONTROL_AE_REGIONS, rs)
@@ -563,7 +659,7 @@ class CameraEngine(
                     }
                     if (recording) {
                         recorder?.start()
-                        onStatus("REC — recording…")
+                        onStatus("REC — ${recordingFps} fps, ${bitrateMbps} Mbps")
                     } else {
                         onStatus("Ready — ${size.width}x${size.height}")
                     }
@@ -587,6 +683,7 @@ class CameraEngine(
         if (d == null) { onDone("Camera not ready"); return }
         if (isRecording) { onDone("Already recording"); return }
         onRecordDone = onDone
+        recordingFps = if (fpsLock > 0) fpsLock else 30
         val hint = computeVideoOrientation()
         try {
             val rec = createRecorder(hint)
@@ -660,15 +757,17 @@ class CameraEngine(
     @Suppress("DEPRECATION")
     private fun createRecorder(hintDeg: Int): MediaRecorder {
         val rec = MediaRecorder() // legacy ctor: works on every Android for minSdk 26
-        rec.setAudioSource(MediaRecorder.AudioSource.MIC)
         rec.setVideoSource(MediaRecorder.VideoSource.SURFACE)
         rec.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-        rec.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-        rec.setAudioEncodingBitRate(128_000)
-        rec.setAudioSamplingRate(44_100)
+        if (audioOn) {
+            rec.setAudioSource(MediaRecorder.AudioSource.MIC)
+            rec.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            rec.setAudioEncodingBitRate(128_000)
+            rec.setAudioSamplingRate(44_100)
+        }
         rec.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-        rec.setVideoEncodingBitRate(12_000_000)
-        rec.setVideoFrameRate(30)
+        rec.setVideoEncodingBitRate(bitrateMbps * 1_000_000)
+        rec.setVideoFrameRate(recordingFps)
         videoSize = pickVideoSize()
         rec.setVideoSize(videoSize.width, videoSize.height)
         rec.setOrientationHint(hintDeg)

@@ -32,6 +32,10 @@ class MainActivity : Activity() {
     private lateinit var panel: LinearLayout
     private lateinit var aeLockChip: TextView
     private lateinit var ping: View
+    private lateinit var fpsChip: TextView
+    private lateinit var eisChip: TextView
+    private lateinit var oisChip: TextView
+    private lateinit var micChip: TextView
 
     private var panelMode: String? = null
 
@@ -139,6 +143,70 @@ class MainActivity : Activity() {
         }
         frame.addView(aeLockChip, aeParams)
 
+        // --- quality/motion chips (top-center stack + top-right) ---
+        fpsChip = makeChip("FPS")
+        fpsChip.setOnClickListener {
+            val qc = engine.qualityCaps() ?: return@setOnClickListener
+            val cycle = listOf(0) + qc.fpsOptions
+            if (cycle.size > 1) {
+                val cur = engine.fpsLockVal()
+                val idx = (cycle.indexOf(cur) + 1) % cycle.size
+                engine.setFpsLock(cycle[idx])
+                updateChipLabels()
+            }
+        }
+        val fpsParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            topMargin = dp(248)
+        }
+        frame.addView(fpsChip, fpsParams)
+
+        eisChip = makeChip("EIS")
+        eisChip.setOnClickListener {
+            engine.setEisOn(!engine.isEisOn())
+            updateChipLabels()
+        }
+        val eisParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            topMargin = dp(296)
+        }
+        frame.addView(eisChip, eisParams)
+
+        micChip = makeChip("MIC")
+        micChip.setOnClickListener {
+            engine.setAudioOn(!engine.isAudioOn())
+            updateChipLabels()
+        }
+        val micParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            topMargin = dp(344)
+        }
+        frame.addView(micChip, micParams)
+
+        oisChip = makeChip("OIS")
+        oisChip.setOnClickListener {
+            engine.setOisOn(!engine.isOisOn())
+            updateChipLabels()
+        }
+        val oisParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.END
+            topMargin = dp(196)
+            marginEnd = dp(16)
+        }
+        frame.addView(oisChip, oisParams)
+
         // --- manual panel (bottom-left) ---
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -193,6 +261,7 @@ class MainActivity : Activity() {
             runOnUiThread {
                 statusView.text = msg
                 syncPanel()
+                updateChipLabels()
             }
         }
 
@@ -263,8 +332,12 @@ class MainActivity : Activity() {
         }
         proToggle.visibility = View.VISIBLE
         val ec = engine.exposureCaps()
+        val qc = engine.qualityCaps()
         val mode = if (engine.isManual()) "PRO" else "AUTO"
-        if (mode == "AUTO" && (ec == null || ec.evMax <= ec.evMin)) {
+        if (mode == "AUTO" &&
+            (ec == null || ec.evMax <= ec.evMin) &&
+            (qc == null || qc.zoomMax <= 1.05f)
+        ) {
             panel.visibility = View.GONE
             return
         }
@@ -287,9 +360,17 @@ class MainActivity : Activity() {
             setPadding(dp(4), dp(2), dp(4), dp(6))
         }
         panel.addView(title)
+        val zoomCaps = engine.qualityCaps()
+        if (zoomCaps != null && zoomCaps.zoomMax > 1.05f) {
+            panel.addView(sliderRow("ZOOM", "1.0x") { p ->
+                val z = 1f + (zoomCaps.zoomMax - 1f) * p / 100f
+                engine.setZoom(z)
+                "%.1fx".format(z)
+            })
+        }
 
         if (!engine.isManual()) {
-            // AUTO mode: just the EV slider — exposure compensation needs AE on.
+            // AUTO mode: EV + recorder bitrate rows (recording-quality group).
             if (ec != null && ec.evMax > ec.evMin) {
                 panel.addView(sliderRow("EV", "0.0") { p ->
                     val idx = ec.evMin +
@@ -300,6 +381,11 @@ class MainActivity : Activity() {
                     if (s.startsWith("-")) s else "+$s"
                 })
             }
+            panel.addView(sliderRow("BITRATE", "12 Mb") { p ->
+                val mb = 4 + p * 56 / 100 // 4..60 Mbps
+                engine.setBitrateMbps(mb)
+                "$mb Mb"
+            })
             return
         }
 
@@ -388,6 +474,36 @@ class MainActivity : Activity() {
             override fun onStopTrackingTouch(s: SeekBar?) { }
         })
         return row
+    }
+
+    private fun makeChip(label: String): TextView =
+        TextView(this).apply {
+            text = label
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            setPadding(dp(16), dp(6), dp(16), dp(6))
+            background = GradientDrawable().apply {
+                cornerRadius = dpF(16f)
+                setColor(Color.argb(140, 0, 0, 0))
+                setStroke(dp(1), Color.argb(255, 255, 255, 90))
+            }
+            alpha = 0.8f
+            visibility = View.GONE // shown once camera caps are known
+        }
+
+    private fun updateChipLabels() {
+        if (!::engine.isInitialized) return
+        val qc = engine.qualityCaps()
+        val fpsSel = engine.fpsLockVal().takeIf { it > 0 } ?: "AUTO"
+        fpsChip.text = "FPS $fpsSel"
+        eisChip.text = if (engine.isEisOn()) "EIS ON" else "EIS OFF"
+        micChip.text = if (engine.isAudioOn()) "MIC ON" else "MIC OFF"
+        oisChip.text = if (engine.isOisOn()) "OIS ON" else "OIS OFF"
+        fpsChip.visibility =
+            if (qc != null && qc.fpsOptions.isNotEmpty()) View.VISIBLE else View.GONE
+        eisChip.visibility = if (qc?.eisSupported == true) View.VISIBLE else View.GONE
+        oisChip.visibility = if (qc?.oisSupported == true) View.VISIBLE else View.GONE
+        micChip.visibility = View.VISIBLE
     }
 
     private fun showPing(x: Float, y: Float) {

@@ -91,6 +91,40 @@ class CapReportActivity : Activity() {
                     sb.append("EV compensation: ${ecr.lower}..${ecr.upper} steps\n")
                 }
 
+                val fps = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                if (fps != null && fps.isNotEmpty()) {
+                    val exact = fps.filter { it.lower == it.upper }
+                        .joinToString(", ") { "${it.lower}" }
+                    sb.append(
+                        "fps lockable: " +
+                            if (exact.isEmpty()) "none (exact)" else exact
+                    )
+                    sb.append("\n")
+                    sb.append(
+                        "fps ranges: " +
+                            fps.joinToString(", ") { "${it.lower}-${it.upper}" }
+                    )
+                    sb.append("\n")
+                }
+                val eis = c.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
+                if (eis != null) {
+                    sb.append(
+                        "video EIS: " +
+                            if (eis.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON)) "yes"
+                            else "no"
+                    )
+                    sb.append("\n")
+                }
+                val ois = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+                if (ois != null) {
+                    sb.append(
+                        "optical OIS: " +
+                            if (ois.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)) "yes"
+                            else "no"
+                    )
+                    sb.append("\n")
+                }
+
                 val caps = (c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
                     ?: IntArray(0)).toList()
                 val capNames = caps.mapNotNull { capName(it) }
