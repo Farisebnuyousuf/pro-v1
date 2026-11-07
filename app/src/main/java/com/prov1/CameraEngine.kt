@@ -326,6 +326,12 @@ class CameraEngine(
                     CaptureRequest.CONTROL_AWB_MODE,
                     CameraMetadata.CONTROL_AWB_MODE_OFF
                 )
+                // Many HALs ignore custom gains unless correction mode is
+                // explicitly transform-matrix — this is the documented fix.
+                b.set(
+                    CaptureRequest.COLOR_CORRECTION_MODE,
+                    CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX
+                )
                 val cct = manualWbTemp ?: 5500
                 b.set(CaptureRequest.COLOR_CORRECTION_GAINS, cctToGains(cct))
             }
@@ -341,19 +347,36 @@ class CameraEngine(
         return b
     }
 
-    // Crude empirical CCT→channel-gain mapping: warm at low K, cool at high K.
+    // Empirical CCT→channel-gain curve, wider than before so the effect is
+    // clearly visible: warm (orange) at low K, cool (blue) at high K.
+    // Anchors are (kelvin, red x100, blue x100); green stays neutral at 1.0.
     private fun cctToGains(cct: Int): RggbChannelVector {
-        val r = when {
-            cct < 3000 -> 1.8f
-            cct < 5000 -> 1.3f
-            cct < 7000 -> 1.0f
-            else -> 0.75f
-        }
-        val b = when {
-            cct < 3000 -> 0.9f
-            cct < 5000 -> 1.1f
-            cct < 7000 -> 1.4f
-            else -> 1.7f
+        val anchors = arrayOf(
+            intArrayOf(2000, 250, 60),
+            intArrayOf(3000, 190, 90),
+            intArrayOf(5500, 100, 100),
+            intArrayOf(7500, 70, 160),
+            intArrayOf(10000, 50, 230)
+        )
+        var r = 1.0f
+        var b = 1.0f
+        if (cct <= anchors.first()[0]) {
+            r = anchors.first()[1] / 100f
+            b = anchors.first()[2] / 100f
+        } else if (cct >= anchors.last()[0]) {
+            r = anchors.last()[1] / 100f
+            b = anchors.last()[2] / 100f
+        } else {
+            for (i in 0 until anchors.size - 1) {
+                val lo = anchors[i]
+                val hi = anchors[i + 1]
+                if (cct >= lo[0] && cct <= hi[0]) {
+                    val t = (cct - lo[0]).toFloat() / (hi[0] - lo[0])
+                    r = (lo[1] + (hi[1] - lo[1]) * t) / 100f
+                    b = (lo[2] + (hi[2] - lo[2]) * t) / 100f
+                    break
+                }
+            }
         }
         val g = 1.0f
         return RggbChannelVector(r, g, g, b)
