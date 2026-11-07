@@ -15,7 +15,7 @@ milestone on real hardware before it counts. Nothing is "done" without phone pro
 | M0 | Camera2-direct foundation, aspect-correct preview (no stretching on rotation) | ✅ banked — owner-verified on hardware |
 | M1 | Record & save with correct orientation metadata | ✅ banked — owner-verified (1080p H.264+AAC, upright, audio, gallery) |
 | M2 | Manual controls v1 (ISO, shutter, focus, WB) + capability report | ✅ banked — owner-verified (WB needed TRANSFORM_MATRIX fix) |
-| M3 | Exposure engine (AE off/lock, tap-to-meter) | ⏳ |
+| M3 | Exposure engine (AE off/lock, tap-to-meter) | ✅ banked — owner-verified (EV, tap-to-meter w/ correct direction, AE lock) |
 | M4 | Quality & motion (fps lock, resolution, bitrate, zoom, stabilization) | ⏳ |
 | M5 | Real log profile via tone-map gamma (+ native log where the device has it) | ⏳ |
 | M6 | Pro UX polish (grid, histogram, level, landscape-first layout) | ⏳ |
