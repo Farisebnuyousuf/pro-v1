@@ -125,6 +125,24 @@ class CapReportActivity : Activity() {
                     sb.append("\n")
                 }
 
+                val tm = c.get(CameraCharacteristics.TONEMAP_AVAILABLE_TONE_MAP_MODES)
+                if (tm != null) {
+                    val names = tm.map { m ->
+                        when (m) {
+                            CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE -> "contrast-curve"
+                            CameraMetadata.TONEMAP_MODE_FAST -> "fast"
+                            CameraMetadata.TONEMAP_MODE_HIGH_QUALITY -> "high-quality"
+                            CameraMetadata.TONEMAP_MODE_GAMMA_VALUE -> "gamma"
+                            CameraMetadata.TONEMAP_MODE_PRESET_CURVE -> "preset"
+                            else -> "mode$m"
+                        }
+                    }
+                    sb.append("tone-map modes: ${names.joinToString(", ")}\n")
+                    c.get(CameraCharacteristics.TONEMAP_MAX_CURVE_POINTS)?.let {
+                        sb.append("tone-map max curve points: $it\n")
+                    }
+                }
+
                 val caps = (c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
                     ?: IntArray(0)).toList()
                 val capNames = caps.mapNotNull { capName(it) }

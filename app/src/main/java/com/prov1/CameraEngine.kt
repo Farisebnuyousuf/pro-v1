@@ -18,6 +18,7 @@ import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.RggbChannelVector
 import android.hardware.camera2.params.StreamConfigurationMap
+import android.hardware.camera2.params.TonemapCurve
 import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
@@ -95,6 +96,12 @@ class CameraEngine(
     private var audioOn = true
     private var bitrateMbps = 12
     private var recordingFps = 30
+
+    // ---- M5 log profile state ----
+    private var tonemapModes: IntArray? = null
+    private var maxCurvePoints = 0
+    private var logCurve: TonemapCurve? = null
+    private var logOn = false
 
     // ---- active session request bookkeeping ----
     private var activeTemplate = 0
@@ -362,6 +369,42 @@ class CameraEngine(
         bitrateMbps = mb.coerceIn(4, 60)
     }
 
+    // ---------- M5: log profile API ----------
+
+    fun logSupported(): Boolean = logCurve != null
+
+    fun isLogOn(): Boolean = logOn && logCurve != null
+
+    fun setLogOn(on: Boolean) {
+        logOn = on
+        refreshRepeatingRequest()
+    }
+
+    /**
+     * Log gamma as a tonemap contrast curve: hard-lifts shadows, rolls
+     * highlights — the flat, wide-latitude look that grades like film.
+     * Format verified against TonemapCurve's documented rules: even-length
+     * (scene-in, curve-out) pairs, >= 2 points, x strictly ascending, every
+     * value in [0, 1], point count <= TONEMAP_MAX_CURVE_POINTS.
+     */
+    private fun buildLogCurve(): TonemapCurve? {
+        if (tonemapModes?.contains(
+                CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE
+            ) != true
+        ) return null
+        if (maxCurvePoints < 7) return null
+        val anchors = floatArrayOf(
+            0.00f, 0.000f, // black pegged — grading keeps it black
+            0.05f, 0.160f, // deep shadows lifted far above linear
+            0.10f, 0.280f,
+            0.20f, 0.420f,
+            0.40f, 0.600f,
+            0.70f, 0.800f, // highlights compressed — detail survives
+            1.00f, 1.000f  // white pegged — no clipping shift
+        )
+        return TonemapCurve(anchors, anchors.copyOf(), anchors.copyOf())
+    }
+
     // ---------- camera open / preview ----------
 
     private fun open() {
@@ -454,6 +497,9 @@ class CameraEngine(
             ?.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON) == true
         oisSupported = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
             ?.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON) == true
+        tonemapModes = chars.get(CameraCharacteristics.TONEMAP_AVAILABLE_TONE_MAP_MODES)
+        maxCurvePoints = chars.get(CameraCharacteristics.TONEMAP_MAX_CURVE_POINTS) ?: 0
+        logCurve = buildLogCurve()
     }
 
     private fun streamMap(): StreamConfigurationMap {
@@ -542,6 +588,18 @@ class CameraEngine(
                 if (oisOn) CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
                 else CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF
             )
+        }
+        // Log profile applies in BOTH control modes (AUTO and PRO manual) and
+        // to every template — preview and REC share the same curve, so what
+        // you watch in the monitor is exactly what lands in the clip.
+        if (logOn) {
+            logCurve?.let { lc ->
+                b.set(
+                    CaptureRequest.TONEMAP_MODE,
+                    CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE
+                )
+                b.set(CaptureRequest.TONEMAP_CURVE, lc)
+            }
         }
         meterRegions?.let { rs ->
             b.set(CaptureRequest.CONTROL_AE_REGIONS, rs)

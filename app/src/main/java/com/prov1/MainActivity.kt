@@ -36,6 +36,7 @@ class MainActivity : Activity() {
     private lateinit var eisChip: TextView
     private lateinit var oisChip: TextView
     private lateinit var micChip: TextView
+    private lateinit var logChip: TextView
 
     private var panelMode: String? = null
 
@@ -207,6 +208,21 @@ class MainActivity : Activity() {
         }
         frame.addView(oisChip, oisParams)
 
+        logChip = makeChip("LOG")
+        logChip.setOnClickListener {
+            engine.setLogOn(!engine.isLogOn())
+            updateChipLabels()
+        }
+        val logParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.END
+            topMargin = dp(248)
+            marginEnd = dp(16)
+        }
+        frame.addView(logChip, logParams)
+
         // --- manual panel (bottom-left) ---
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -296,7 +312,7 @@ class MainActivity : Activity() {
             false
         }
 
-        statusView.text = "Pro V1 — M3 exposure build"
+        statusView.text = "Pro V1 — M5 log build"
     }
 
     override fun onResume() {
@@ -506,6 +522,10 @@ class MainActivity : Activity() {
         eisChip.visibility = if (qc?.eisSupported == true) View.VISIBLE else View.GONE
         oisChip.visibility = if (qc?.oisSupported == true) View.VISIBLE else View.GONE
         micChip.visibility = View.VISIBLE
+        logChip.text = if (engine.isLogOn()) "LOG ON" else "LOG OFF"
+        logChip.alpha = if (engine.isLogOn()) 1f else 0.6f
+        logChip.visibility =
+            if (engine.logSupported()) View.VISIBLE else View.GONE
     }
 
     private fun showPing(x: Float, y: Float) {
