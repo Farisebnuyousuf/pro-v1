@@ -1,12 +1,16 @@
 package com.prov1
 
+import android.Manifest
 import android.app.Activity
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.SurfaceTexture
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.view.Gravity
 import android.view.TextureView
+import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.TextView
@@ -16,6 +20,7 @@ class MainActivity : Activity() {
     private lateinit var engine: CameraEngine
     private lateinit var textureView: TextureView
     private lateinit var statusView: TextView
+    private lateinit var recordBtn: View
 
     private var surfaceReady = false
 
@@ -49,6 +54,21 @@ class MainActivity : Activity() {
             )
         )
 
+        recordBtn = View(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.argb(235, 255, 255, 255))
+                setStroke(dp(4), Color.argb(255, 235, 235, 235))
+            }
+            contentDescription = "Record"
+        }
+        val btnSize = dp(72)
+        val btnParams = FrameLayout.LayoutParams(btnSize, btnSize)
+        btnParams.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+        btnParams.bottomMargin = dp(64)
+        frame.addView(recordBtn, btnParams)
+        recordBtn.setOnClickListener { onRecordPressed() }
+
         setContentView(frame)
 
         engine = CameraEngine(this) { msg ->
@@ -76,11 +96,14 @@ class MainActivity : Activity() {
             override fun onSurfaceTextureUpdated(st: SurfaceTexture) { }
         }
 
-        statusView.text = "Pro V1 — M0 foundation build"
+        statusView.text = "Pro V1 — M1 record build"
     }
 
     override fun onResume() {
         super.onResume()
+        if (!engine.isRecording) {
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR
+        }
         maybeStart()
     }
 
@@ -108,18 +131,70 @@ class MainActivity : Activity() {
         if (surfaceReady) engine.start(textureView)
     }
 
+    private fun onRecordPressed() {
+        if (engine.isRecording) {
+            engine.stopRecording { msg ->
+                runOnUiThread {
+                    statusView.text = msg
+                    setRecordBtnIdle()
+                }
+            }
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR
+            return
+        }
+        if (!engine.hasAudioPermission()) {
+            statusView.text = "Microphone permission needed for audio recording"
+            requestPermissions(
+                arrayOf(Manifest.permission.RECORD_AUDIO), CameraEngine.REQ_AUDIO
+            )
+            return
+        }
+        if (!surfaceReady || !engine.hasPermission()) return
+        // Lock orientation so the saved clip metadata matches one fixed rotation.
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LOCKED
+        engine.startRecording { msg ->
+            runOnUiThread {
+                statusView.text = msg
+                if (engine.isRecording) setRecordBtnRecording()
+            }
+        }
+    }
+
+    private fun setRecordBtnIdle() {
+        (recordBtn.background as? GradientDrawable)?.apply {
+            setColor(Color.argb(235, 255, 255, 255))
+        }
+    }
+
+    private fun setRecordBtnRecording() {
+        (recordBtn.background as? GradientDrawable)?.apply {
+            setColor(Color.argb(235, 255, 90, 90))
+        }
+    }
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<String>,
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == CameraEngine.REQ_CAMERA) {
-            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
-                if (surfaceReady) engine.start(textureView)
-            } else {
-                statusView.setTextColor(Color.RED)
-                statusView.text = "Camera permission is required to use Pro V1"
+        when (requestCode) {
+            CameraEngine.REQ_CAMERA -> {
+                if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+                    if (surfaceReady) engine.start(textureView)
+                } else {
+                    statusView.setTextColor(Color.RED)
+                    statusView.text = "Camera permission is required to use Pro V1"
+                }
+            }
+            CameraEngine.REQ_AUDIO -> {
+                if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+                    onRecordPressed()
+                } else {
+                    statusView.text = "Audio denied — recording needs mic access"
+                }
             }
         }
     }

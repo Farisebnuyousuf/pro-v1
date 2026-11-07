@@ -2,6 +2,7 @@ package com.prov1
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Matrix
@@ -14,12 +15,22 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.StreamConfigurationMap
+import android.media.MediaRecorder
+import android.net.Uri
+import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.ParcelFileDescriptor
+import android.provider.MediaStore
 import android.util.Size
 import android.view.Surface
 import android.view.TextureView
 import android.view.WindowManager
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class CameraEngine(
     private val context: Context,
@@ -33,11 +44,26 @@ class CameraEngine(
     private var handler: Handler? = null
 
     private var cameraId: String? = null
-    private var sensorOrientation = 0
+    private var sensorOrientation = 90
+    private var backCamera = true
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var textureView: TextureView? = null
     private var previewSize: Size? = null
+    private var videoSize: Size = Size(1920, 1080)
+
+    private var previewSurface: Surface? = null
+
+    // M1 recorder state
+    private var recorder: MediaRecorder? = null
+    private var recorderSurface: Surface? = null
+    private var outputDescriptor: ParcelFileDescriptor? = null
+    private var outputUri: Uri? = null
+    private var outputPath: File? = null
+    private var onRecordDone: ((String) -> Unit)? = null
+
+    @Volatile var isRecording = false
+        private set
 
     @Volatile private var opening = false
 
@@ -53,6 +79,7 @@ class CameraEngine(
     }
 
     fun stop() {
+        abandonRecording()
         synchronized(lock) {
             session?.close()
             session = null
@@ -60,7 +87,9 @@ class CameraEngine(
             device = null
             opening = false
         }
-        onStatus("Preview stopped")
+        // Surface may be destroyed with the activity; drop refs so resume rebuilds.
+        previewSurface = null
+        previewSize = null
     }
 
     fun release() {
@@ -69,7 +98,20 @@ class CameraEngine(
         thread = null
         handler = null
         textureView = null
+        previewSurface = null
         previewSize = null
+    }
+
+    fun hasPermission(): Boolean =
+        context.checkSelfPermission(Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+
+    fun hasAudioPermission(): Boolean =
+        context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+
+    fun requestPermission(activity: android.app.Activity) {
+        activity.requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
     }
 
     fun updateTransform() {
@@ -78,13 +120,7 @@ class CameraEngine(
         t.post { applyTransform(t, size, displayRotationDegrees()) }
     }
 
-    fun hasPermission(): Boolean =
-        context.checkSelfPermission(Manifest.permission.CAMERA) ==
-            PackageManager.PERMISSION_GRANTED
-
-    fun requestPermission(activity: android.app.Activity) {
-        activity.requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
-    }
+    // ---------- camera open / preview ----------
 
     private fun open() {
         if (device != null || opening) return
@@ -105,7 +141,7 @@ class CameraEngine(
                         device = d
                     }
                     onStatus("Camera open — configuring…")
-                    createSession(d)
+                    buildSession(withRecorder = false)
                 }
                 override fun onDisconnected(d: CameraDevice) {
                     synchronized(lock) { device = null }
@@ -135,6 +171,7 @@ class CameraEngine(
                 CameraMetadata.LENS_FACING_BACK
             ) {
                 cameraId = id
+                backCamera = true
                 sensorOrientation =
                     chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: sensorOrientation
                 return id
@@ -143,15 +180,30 @@ class CameraEngine(
         }
         fallback?.let {
             cameraId = it
+            backCamera = false
             sensorOrientation =
-                manager.getCameraCharacteristics(it).let { c ->
-                    c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
-                }
+                manager.getCameraCharacteristics(it).get(CameraCharacteristics.SENSOR_ORIENTATION)
+                    ?: sensorOrientation
         }
         return fallback
     }
 
-    private fun createSession(d: CameraDevice) {
+    private fun streamMap(): StreamConfigurationMap {
+        val id = cameraId ?: throw IllegalStateException("Camera not selected")
+        val chars = manager.getCameraCharacteristics(id)
+        return chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?: throw IllegalStateException("Stream configuration unavailable")
+    }
+
+    private fun getOutputSizesFor(d: CameraDevice, klass: Class<SurfaceTexture>): Array<Size> =
+        streamMap().getOutputSizes(klass)
+
+    private fun buildSession(withRecorder: Boolean) {
+        val d = device
+        if (d == null) {
+            onStatus("Camera not ready")
+            return
+        }
         val t = textureView
         if (t == null || !t.isAvailable) {
             onStatus("Waiting for preview surface…")
@@ -161,34 +213,50 @@ class CameraEngine(
             onStatus("Preview surface not ready")
             return
         }
-        val sizes = getOutputSizesFor(d, SurfaceTexture::class.java)
-        if (sizes.isNullOrEmpty()) {
-            onStatus("No output sizes reported")
-            return
+        if (previewSize == null) {
+            val sizes = getOutputSizesFor(d, SurfaceTexture::class.java)
+            previewSize = pickSize(sizes, t.width, t.height)
         }
-        previewSize = pickSize(sizes, t.width, t.height)
         val size = previewSize!!
         st.setDefaultBufferSize(size.width, size.height)
-        val surface = Surface(st)
+        val surface = previewSurface ?: Surface(st).also { previewSurface = it }
+
+        val outputs = mutableListOf(surface)
+        val recSurf = recorderSurface
+        if (withRecorder && isRecording) {
+            recSurf?.let { outputs.add(it) }
+        }
 
         val h = handler
         if (h == null) return
         try {
-            d.createCaptureSession(listOf(surface), object
-                : CameraCaptureSession.StateCallback() {
+            d.createCaptureSession(outputs, object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     synchronized(lock) { session = s }
-                    val req = d.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                    val template =
+                        if (withRecorder && isRecording) CameraDevice.TEMPLATE_RECORD
+                        else CameraDevice.TEMPLATE_PREVIEW
+                    val req = d.createCaptureRequest(template)
                         .apply {
                             addTarget(surface)
+                            if (withRecorder && isRecording) recSurf?.let { addTarget(it) }
                             set(
                                 CaptureRequest.CONTROL_AF_MODE,
-                                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                                if (withRecorder && isRecording)
+                                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+                                else
+                                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
                             )
                         }
                     s.setRepeatingRequest(req.build(), null, h)
-                    onStatus("Ready — ${size.width}x${size.height}")
-                    applyTransform(t, size, displayRotationDegrees())
+                    if (withRecorder && isRecording) {
+                        recorder?.start()
+                        onStatus("REC — recording…")
+                        applyTransform(t, size, displayRotationDegrees())
+                    } else {
+                        onStatus("Ready — ${size.width}x${size.height}")
+                        applyTransform(t, size, displayRotationDegrees())
+                    }
                 }
                 override fun onConfigureFailed(s: CameraCaptureSession) {
                     onStatus("Session configuration failed")
@@ -199,21 +267,196 @@ class CameraEngine(
         }
     }
 
-    private fun getOutputSizesFor(
-        d: CameraDevice,
-        klass: Class<SurfaceTexture>
-    ): Array<Size> {
-        val chars = manager.getCameraCharacteristics(d.id)
-        val maps = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            ?: throw IllegalStateException("Stream configuration unavailable")
-        return maps.getOutputSizes(klass)
+    // ---------- recording ----------
+
+    fun startRecording(onDone: (String) -> Unit) {
+        val h = handler
+        if (h == null) { onDone("Engine stopped"); return }
+        val d = device
+        if (d == null) { onDone("Camera not ready"); return }
+        if (isRecording) { onDone("Already recording"); return }
+        onRecordDone = onDone
+        val hint = computeVideoOrientation()
+        try {
+            val rec = createRecorder(hint)
+            rec.prepare()
+            recorder = rec
+            recorderSurface = rec.surface
+            isRecording = true // intent flag; actual start happens in onConfigured
+            log("recorder prepared ${videoSize.width}x${videoSize.height}")
+        } catch (e: Exception) {
+            cleanupRecorder()
+            onDone("Recorder failed: ${e.localizedMessage}")
+            return
+        }
+        h.post { buildSession(withRecorder = true) }
     }
+
+    fun stopRecording(onDone: (String) -> Unit) {
+        val h = handler
+        if (h == null) { onDone("Engine stopped"); return }
+        if (recorder == null) { onDone("Not recording"); return }
+        onRecordDone = onDone
+        h.post { finishRecording() }
+    }
+
+    private fun finishRecording() {
+        val rec = recorder ?: return
+        isRecording = false
+        val ok = try {
+            rec.stop()
+            true
+        } catch (e: Exception) {
+            log("stop failed: ${e.localizedMessage}")
+            false
+        }
+        try { rec.reset(); rec.release() } catch (_: Exception) { }
+        recorder = null
+        recorderSurface = null
+        val saved = finalizeOutput(ok)
+        rebuildPreviewSession()
+        onRecordDone?.invoke(
+            when {
+                ok && saved.startsWith("Saved") -> saved
+                ok -> "Recording discarded"
+                else -> "Recording was empty — discarded"
+            }
+        )
+        onRecordDone = null
+    }
+
+    private fun rebuildPreviewSession() {
+        val d = device
+        if (d == null) return
+        buildSession(withRecorder = false)
+    }
+
+    private fun abandonRecording() {
+        if (recorder != null) {
+            val rec = recorder
+            isRecording = false
+            try { rec?.stop() } catch (_: Exception) { }
+            try { rec?.reset(); rec?.release() } catch (_: Exception) { }
+            recorder = null
+            recorderSurface = null
+            finalizeOutput(false)
+        }
+        outputDescriptor = null
+        outputUri = null
+        outputPath = null
+    }
+
+    @Suppress("DEPRECATION")
+    private fun createRecorder(hintDeg: Int): MediaRecorder {
+        val rec = MediaRecorder() // legacy ctor: works on every Android for minSdk 26
+        rec.setAudioSource(MediaRecorder.AudioSource.MIC)
+        rec.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+        rec.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+        rec.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+        rec.setAudioEncodingBitRate(128_000)
+        rec.setAudioSamplingRate(44_100)
+        rec.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+        rec.setVideoEncodingBitRate(12_000_000)
+        rec.setVideoFrameRate(30)
+        videoSize = pickVideoSize()
+        rec.setVideoSize(videoSize.width, videoSize.height)
+        rec.setOrientationHint(hintDeg)
+        openOutput(rec)
+        return rec
+    }
+
+    private fun pickVideoSize(): Size {
+        val sizes = streamMap().getOutputSizes(MediaRecorder::class.java)
+        val target = 16.0 / 9.0
+        var best: Size? = null
+        var bestArea = 0
+        for (s in sizes) {
+            val ratio = maxOf(s.width, s.height).toDouble() /
+                minOf(s.width, s.height).coerceAtLeast(1)
+            if (ratio < 1.70 || ratio > 1.86) continue
+            val area = s.width * s.height
+            // M1 default: keep to 1080p-class; 4K comes with the quality milestone.
+            if (area > 2_200_000) continue
+            if (area > bestArea) {
+                bestArea = area
+                best = s
+            }
+        }
+        val intent = best
+        if (intent != null) return intent
+        return sizes.maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
+    }
+
+    private fun computeVideoOrientation(): Int {
+        val display = displayRotationDegrees()
+        return if (backCamera) {
+            (sensorOrientation - display + 360) % 360
+        } else {
+            (sensorOrientation + display + 360) % 360
+        }
+    }
+
+    private fun openOutput(rec: MediaRecorder) {
+        val name = "ProV1_" +
+            SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
+        if (Build.VERSION.SDK_INT >= 29) {
+            val values = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, name)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Pro V1")
+                put(MediaStore.Video.Media.IS_PENDING, 1)
+            }
+            val uri = context.contentResolver.insert(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values
+            )
+            val fd = context.contentResolver.openFileDescriptor(uri!!, "rw")
+            outputDescriptor = fd
+            outputUri = uri
+            rec.setOutputFile(fd!!.fileDescriptor)
+        } else {
+            val dir = File(
+                context.getExternalFilesDir(Environment.DIRECTORY_MOVIES), "Pro V1"
+            )
+            dir.mkdirs()
+            val file = File(dir, name)
+            outputPath = file
+            rec.setOutputFile(file.absolutePath)
+        }
+    }
+
+    private fun finalizeOutput(ok: Boolean): String {
+        val uri = outputUri
+        if (uri != null) {
+            val values = ContentValues()
+            if (ok) {
+                values.put(MediaStore.Video.Media.IS_PENDING, 0)
+                context.contentResolver.update(uri, values, null, null)
+                outputDescriptor?.close()
+                outputUri = null
+                outputDescriptor = null
+                return "Saved to gallery"
+            } else {
+                context.contentResolver.delete(uri, null, null)
+                outputDescriptor?.close()
+                outputUri = null
+                outputDescriptor = null
+                return "Failed"
+            }
+        }
+        val file = outputPath
+        if (file != null) {
+            if (ok) return "Saved to ${file.parentFile?.name}"
+            file.delete()
+        }
+        outputPath = null
+        return "Failed"
+    }
+
+    // ---------- utils ----------
 
     private fun pickSize(sizes: Array<Size>, viewW: Int, viewH: Int): Size {
         val vw = viewW.coerceAtLeast(1)
         val vh = viewH.coerceAtLeast(1)
-        // Normalize both ratios to "long side / short side" so portrait/landscape
-        // views select the same-shaped buffers.
         val viewRatio = maxOf(vw, vh).coerceAtLeast(1).toDouble() /
             minOf(vw, vh).coerceAtLeast(1).toDouble()
         val viewArea = vw.toDouble() * vh.toDouble()
@@ -221,7 +464,6 @@ class CameraEngine(
         var bestScore = Double.MAX_VALUE
         for (s in sizes) {
             val area = s.width.toDouble() * s.height
-            // Fit-class buffers only; skip absurd outliers like 8K still sizes.
             if (area > viewArea * 1.6) continue
             val cand = maxOf(s.width, s.height).coerceAtLeast(1).toDouble() /
                 minOf(s.width, s.height).coerceAtLeast(1).toDouble()
@@ -271,7 +513,24 @@ class CameraEngine(
         }
     }
 
+    private fun cleanupRecorder() {
+        try { recorder?.reset(); recorder?.release() } catch (_: Exception) { }
+        recorder = null
+        recorderSurface = null
+        outputDescriptor?.close()
+        outputDescriptor = null
+        outputUri = null
+        outputPath = null
+        isRecording = false
+    }
+
+    private fun log(msg: String) {
+        android.util.Log.i("pro-v1", msg)
+        onStatus(msg)
+    }
+
     companion object {
         const val REQ_CAMERA = 101
+        const val REQ_AUDIO = 202
     }
 }
