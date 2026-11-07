@@ -6,6 +6,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Matrix
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
@@ -14,6 +15,7 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.RggbChannelVector
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.MediaRecorder
@@ -25,6 +27,7 @@ import android.os.HandlerThread
 import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import android.util.Range
+import android.util.Rational
 import android.util.Size
 import android.view.Surface
 import android.view.TextureView
@@ -69,6 +72,16 @@ class CameraEngine(
     private var manualShutterNs: Long? = null
     private var manualFocusD: Float? = null
     private var manualWbTemp: Int? = null
+
+    // ---- M3 exposure engine state ----
+    private var activeRect: Rect? = null
+    private var maxMeterRegions = 0
+    private var evRange: Range<Int>? = null
+    private var evStep = 1f
+    private var meterRegions: Array<MeteringRectangle>? = null
+    private var aeLocked = false
+    private var evComp = 0
+    private var transformMatrix: Matrix? = null
 
     // ---- active session request bookkeeping ----
     private var activeTemplate = 0
@@ -204,6 +217,85 @@ class CameraEngine(
         refreshRepeatingRequest()
     }
 
+    // ---------- M3: exposure engine API ----------
+
+    data class ExposureCaps(
+        val meteringSupported: Boolean,
+        val evMin: Int,
+        val evMax: Int,
+        val evStep: Float
+    )
+
+    fun exposureCaps(): ExposureCaps? {
+        if (cameraId == null) return null
+        val r = evRange
+        return ExposureCaps(
+            meteringSupported = maxMeterRegions > 0,
+            evMin = r?.lower ?: 0,
+            evMax = r?.upper ?: 0,
+            evStep = evStep
+        )
+    }
+
+    fun isAeLocked(): Boolean = aeLocked
+
+    fun setAeLock(on: Boolean) {
+        aeLocked = on
+        refreshRepeatingRequest()
+    }
+
+    fun setEvComp(stepIndex: Int) {
+        val r = evRange
+        evComp = if (r != null) stepIndex.coerceIn(r.lower, r.upper) else 0
+        refreshRepeatingRequest()
+    }
+
+    fun clearMetering() {
+        if (meterRegions != null) {
+            meterRegions = null
+            refreshRepeatingRequest()
+        }
+    }
+
+    /**
+     * Converts a tap in TextureView coordinates into a metering region (AE + AF).
+     * Mapping chain (direction verified against AOSP hwui/camera code): tap →
+     * invert(scene matrix) → content px → normalized → front-mirror + sensor
+     * rotation correction → active-array rect.
+     */
+    fun setMeterAtView(x: Float, y: Float): Boolean {
+        val t = textureView ?: return false
+        val active = activeRect ?: return false
+        val m = transformMatrix ?: return false
+        val vw = t.width.coerceAtLeast(1).toFloat()
+        val vh = t.height.coerceAtLeast(1).toFloat()
+        val inv = Matrix()
+        if (!m.invert(inv)) return false
+        val pts = floatArrayOf(x, y)
+        inv.mapPoints(pts)
+        var unx = (pts[0] / vw).coerceIn(0f, 1f)
+        var uny = (pts[1] / vh).coerceIn(0f, 1f)
+        if (!backCamera) unx = 1f - unx
+        val eff = (sensorOrientation - displayRotationDegrees() + 360) % 360
+        val snx: Float
+        val sny: Float
+        when (eff) {
+            90 -> { snx = uny; sny = 1f - unx }
+            180 -> { snx = 1f - unx; sny = 1f - uny }
+            270 -> { snx = 1f - uny; sny = unx }
+            else -> { snx = unx; sny = uny }
+        }
+        val sx = active.left + (snx * active.width()).toInt()
+        val sy = active.top + (sny * active.height()).toInt()
+        val half = maxOf(active.width(), active.height()) / 10
+        val rect = Rect(sx - half, sy - half, sx + half, sy + half)
+        rect.intersect(active)
+        if (rect.width() <= 0 || rect.height() <= 0) return false
+        meterRegions = arrayOf(MeteringRectangle(rect, 1000))
+        refreshRepeatingRequest()
+        return true
+    }
+
     // ---------- camera open / preview ----------
 
     private fun open() {
@@ -279,6 +371,15 @@ class CameraEngine(
             ?.contains(CameraMetadata.CONTROL_AWB_MODE_OFF) == true
         aeOffSupported = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES)
             ?.contains(CameraMetadata.CONTROL_AE_MODE_OFF) == true
+        activeRect = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        maxMeterRegions = (chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE)
+            ?: chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF)) ?: 0
+        evRange = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+        evStep = 1f
+        val st = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
+        if (st != null && st.denominator > 0 && st.numerator > 0) {
+            evStep = st.numerator.toFloat() / st.denominator
+        }
     }
 
     private fun streamMap(): StreamConfigurationMap {
@@ -343,6 +444,12 @@ class CameraEngine(
                 else
                     CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
             )
+            if (aeLocked) b.set(CaptureRequest.CONTROL_AE_LOCK, true)
+            if (evComp != 0) b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, evComp)
+        }
+        meterRegions?.let { rs ->
+            b.set(CaptureRequest.CONTROL_AE_REGIONS, rs)
+            b.set(CaptureRequest.CONTROL_AF_REGIONS, rs)
         }
         return b
     }
@@ -702,6 +809,7 @@ class CameraEngine(
             else -> { }
         }
         t.setTransform(m)
+        transformMatrix = Matrix(m)
     }
 
     @Suppress("DEPRECATION")

@@ -84,6 +84,13 @@ class CapReportActivity : Activity() {
                 val zoom = c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
                 if (zoom != null) sb.append("zoom range: %.2fx..%.2fx\n".format(zoom.lower, zoom.upper))
 
+                val regions = c.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
+                if (regions > 0) sb.append("AE metering regions: $regions\n")
+                val ecr = c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+                if (ecr != null && ecr.lower != ecr.upper) {
+                    sb.append("EV compensation: ${ecr.lower}..${ecr.upper} steps\n")
+                }
+
                 val caps = (c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
                     ?: IntArray(0)).toList()
                 val capNames = caps.mapNotNull { capName(it) }

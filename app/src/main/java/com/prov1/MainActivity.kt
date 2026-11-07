@@ -10,6 +10,7 @@ import android.graphics.SurfaceTexture
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.TextureView
 import android.view.View
 import android.view.WindowManager
@@ -29,8 +30,10 @@ class MainActivity : Activity() {
     private lateinit var proToggle: TextView
     private lateinit var infoBtn: TextView
     private lateinit var panel: LinearLayout
+    private lateinit var aeLockChip: TextView
+    private lateinit var ping: View
 
-    private var panelBuilt = false
+    private var panelMode: String? = null
 
     private var surfaceReady = false
 
@@ -110,6 +113,32 @@ class MainActivity : Activity() {
         }
         frame.addView(infoBtn, infoParams)
 
+        // --- AE lock chip (below PRO chip) ---
+        aeLockChip = TextView(this).apply {
+            text = "AE LOCK"
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            setPadding(dp(16), dp(6), dp(16), dp(6))
+            background = GradientDrawable().apply {
+                cornerRadius = dpF(16f)
+                setColor(Color.argb(140, 0, 0, 0))
+                setStroke(dp(1), Color.argb(255, 255, 255, 90))
+            }
+            alpha = 0.6f
+        }
+        aeLockChip.setOnClickListener {
+            engine.setAeLock(!engine.isAeLocked())
+            stylizeAeChip()
+        }
+        val aeParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            topMargin = dp(196)
+        }
+        frame.addView(aeLockChip, aeParams)
+
         // --- manual panel (bottom-left) ---
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -146,6 +175,18 @@ class MainActivity : Activity() {
         frame.addView(recordBtn, btnParams)
         recordBtn.setOnClickListener { onRecordPressed() }
 
+        // --- metering tap indicator ---
+        ping = View(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.TRANSPARENT)
+                setStroke(dp(2), Color.argb(230, 255, 255, 120))
+            }
+            alpha = 0f
+            isClickable = false
+        }
+        frame.addView(ping, FrameLayout.LayoutParams(dp(72), dp(72)))
+
         setContentView(frame)
 
         engine = CameraEngine(this) { msg ->
@@ -176,7 +217,15 @@ class MainActivity : Activity() {
             override fun onSurfaceTextureUpdated(st: SurfaceTexture) { }
         }
 
-        statusView.text = "Pro V1 — M2 manual build"
+        textureView.setOnTouchListener { _, ev ->
+            if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
+                if (engine.setMeterAtView(ev.x, ev.y)) showPing(ev.x, ev.y)
+                else statusView.text = "Tap metering not supported by this camera"
+            }
+            false
+        }
+
+        statusView.text = "Pro V1 — M3 exposure build"
     }
 
     override fun onResume() {
@@ -213,26 +262,46 @@ class MainActivity : Activity() {
             return
         }
         proToggle.visibility = View.VISIBLE
-        if (!engine.isManual()) {
+        val ec = engine.exposureCaps()
+        val mode = if (engine.isManual()) "PRO" else "AUTO"
+        if (mode == "AUTO" && (ec == null || ec.evMax <= ec.evMin)) {
             panel.visibility = View.GONE
             return
         }
         panel.visibility = View.VISIBLE
-        if (!panelBuilt) {
-            panelBuilt = true
-            buildPanel(caps)
+        if (panelMode != mode) {
+            panelMode = mode
+            buildPanel(caps, ec)
         }
     }
 
-    private fun buildPanel(caps: CameraEngine.ManualCaps) {
+    private fun buildPanel(
+        caps: CameraEngine.ManualCaps,
+        ec: CameraEngine.ExposureCaps?
+    ) {
         panel.removeAllViews()
         val title = TextView(this).apply {
-            text = "MANUAL"
+            text = if (engine.isManual()) "MANUAL" else "EXPOSURE"
             setTextColor(Color.argb(255, 255, 255, 90))
             textSize = 12f
             setPadding(dp(4), dp(2), dp(4), dp(6))
         }
         panel.addView(title)
+
+        if (!engine.isManual()) {
+            // AUTO mode: just the EV slider — exposure compensation needs AE on.
+            if (ec != null && ec.evMax > ec.evMin) {
+                panel.addView(sliderRow("EV", "0.0") { p ->
+                    val idx = ec.evMin +
+                        (((ec.evMax - ec.evMin).toLong() * p) / 100L).toInt()
+                    engine.setEvComp(idx)
+                    val ev = idx * ec.evStep
+                    val s = "%.1f".format(ev)
+                    if (s.startsWith("-")) s else "+$s"
+                })
+            }
+            return
+        }
 
         if (caps.isoMax > caps.isoMin) {
             panel.addView(sliderRow("ISO", "%,d".format(caps.isoMax)) { p ->
@@ -319,6 +388,28 @@ class MainActivity : Activity() {
             override fun onStopTrackingTouch(s: SeekBar?) { }
         })
         return row
+    }
+
+    private fun showPing(x: Float, y: Float) {
+        val d = dp(72) / 2
+        (ping.layoutParams as? FrameLayout.LayoutParams)?.also { lp ->
+            lp.leftMargin = (x - d).toInt()
+            lp.topMargin = (y - d).toInt()
+            ping.layoutParams = lp
+        }
+        ping.alpha = 1f
+        ping.animate().setStartDelay(600).setDuration(300).alpha(0f).start()
+    }
+
+    private fun stylizeAeChip() {
+        if (!::engine.isInitialized) return
+        if (engine.isAeLocked()) {
+            aeLockChip.text = "AE LOCKED"
+            aeLockChip.alpha = 1f
+        } else {
+            aeLockChip.text = "AE LOCK"
+            aeLockChip.alpha = 0.6f
+        }
     }
 
     private fun onProToggle() {
