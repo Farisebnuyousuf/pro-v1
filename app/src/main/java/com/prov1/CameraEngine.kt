@@ -6,17 +6,18 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Matrix
 import android.graphics.RectF
+import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.params.StreamConfigurationMap
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Size
 import android.view.Surface
-import android.view.SurfaceTexture
 import android.view.TextureView
 import android.view.WindowManager
 
@@ -202,14 +203,10 @@ class CameraEngine(
         d: CameraDevice,
         klass: Class<SurfaceTexture>
     ): Array<Size> {
-        return if (android.os.Build.VERSION.SDK_INT >= 31) {
-            d.getOutputSizes(klass)
-        } else {
-            val maps = manager.getCameraCharacteristics(d.id)
-                .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                ?: throw IllegalStateException("Stream configuration unavailable")
-            maps.getOutputSizes(klass)
-        }
+        val chars = manager.getCameraCharacteristics(d.id)
+        val maps = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?: throw IllegalStateException("Stream configuration unavailable")
+        return maps.getOutputSizes(klass)
     }
 
     private fun pickSize(sizes: Array<Size>, viewW: Int, viewH: Int): Size {
