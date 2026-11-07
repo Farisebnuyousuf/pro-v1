@@ -12,8 +12,8 @@ milestone on real hardware before it counts. Nothing is "done" without phone pro
 
 | M | Milestone | Status |
 |---|-----------|--------|
-| M0 | Camera2-direct foundation, aspect-correct preview (no stretching on rotation) | 🚧 in progress |
-| M1 | Record & save with correct orientation metadata | ⏳ |
+| M0 | Camera2-direct foundation, aspect-correct preview (no stretching on rotation) | ✅ banked — owner-verified on hardware |
+| M1 | Record & save with correct orientation metadata | ✅ banked — owner-verified (1080p H.264+AAC, upright, audio, gallery) |
 | M2 | Manual controls v1 (ISO, shutter, focus, WB) + capability report | ⏳ |
 | M3 | Exposure engine (AE off/lock, tap-to-meter) | ⏳ |
 | M4 | Quality & motion (fps lock, resolution, bitrate, zoom, stabilization) | ⏳ |
