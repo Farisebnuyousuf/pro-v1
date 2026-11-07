@@ -14,6 +14,7 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.params.RggbChannelVector
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.MediaRecorder
 import android.net.Uri
@@ -23,6 +24,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
+import android.util.Range
 import android.util.Size
 import android.view.Surface
 import android.view.TextureView
@@ -54,7 +56,26 @@ class CameraEngine(
 
     private var previewSurface: Surface? = null
 
-    // M1 recorder state
+    // ---- capability snapshot (M2) ----
+    private var isoRange: Range<Int>? = null
+    private var exposureRange: Range<Long>? = null
+    private var maxFocusDiopter: Float? = null
+    private var awbOffSupported = false
+    private var aeOffSupported = false
+
+    // ---- manual state (M2) ----
+    private var manualMode = false
+    private var manualIso: Int? = null
+    private var manualShutterNs: Long? = null
+    private var manualFocusD: Float? = null
+    private var manualWbTemp: Int? = null
+
+    // ---- active session request bookkeeping ----
+    private var activeTemplate = 0
+    private var activeTargets: List<Surface>? = null
+    private var activeWithRecorder = false
+
+    // ---- M1 recorder state ----
     private var recorder: MediaRecorder? = null
     private var recorderSurface: Surface? = null
     private var outputDescriptor: ParcelFileDescriptor? = null
@@ -120,6 +141,69 @@ class CameraEngine(
         t.post { applyTransform(t, size, displayRotationDegrees()) }
     }
 
+    // ---------- M2: manual controls API ----------
+
+    data class ManualCaps(
+        val manualPossible: Boolean,
+        val isoMin: Int,
+        val isoMax: Int,
+        val shutterMinNs: Long,
+        val shutterMaxNs: Long,
+        val focusMaxDiopter: Float,
+        val wbOffSupported: Boolean
+    )
+
+    fun isManual(): Boolean = manualMode
+
+    fun manualCaps(): ManualCaps? {
+        if (cameraId == null) return null
+        val iso = isoRange
+        val exp = exposureRange
+        val focus = maxFocusDiopter ?: 0f
+        val manualPossible = aeOffSupported && awbOffSupported &&
+            iso != null && exp != null
+        return ManualCaps(
+            manualPossible = manualPossible,
+            isoMin = iso?.lower ?: 0,
+            isoMax = iso?.upper ?: 0,
+            shutterMinNs = exp?.lower ?: 0L,
+            shutterMaxNs = exp?.upper ?: 0L,
+            focusMaxDiopter = focus,
+            wbOffSupported = awbOffSupported
+        )
+    }
+
+    fun setManualMode(on: Boolean) {
+        manualMode = on
+        if (!on) {
+            manualIso = null
+            manualShutterNs = null
+            manualFocusD = null
+            manualWbTemp = null
+        }
+        refreshRepeatingRequest()
+    }
+
+    fun setManualIso(v: Int) {
+        manualIso = v
+        refreshRepeatingRequest()
+    }
+
+    fun setManualShutterNs(ns: Long) {
+        manualShutterNs = ns
+        refreshRepeatingRequest()
+    }
+
+    fun setManualFocusDiopter(d: Float) {
+        manualFocusD = d
+        refreshRepeatingRequest()
+    }
+
+    fun setManualWbTemp(kelvin: Int) {
+        manualWbTemp = kelvin
+        refreshRepeatingRequest()
+    }
+
     // ---------- camera open / preview ----------
 
     private fun open() {
@@ -172,8 +256,7 @@ class CameraEngine(
             ) {
                 cameraId = id
                 backCamera = true
-                sensorOrientation =
-                    chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: sensorOrientation
+                snapshotCapabilities(chars)
                 return id
             }
             if (fallback == null) fallback = id
@@ -181,11 +264,21 @@ class CameraEngine(
         fallback?.let {
             cameraId = it
             backCamera = false
-            sensorOrientation =
-                manager.getCameraCharacteristics(it).get(CameraCharacteristics.SENSOR_ORIENTATION)
-                    ?: sensorOrientation
+            snapshotCapabilities(manager.getCameraCharacteristics(it))
         }
         return fallback
+    }
+
+    private fun snapshotCapabilities(chars: CameraCharacteristics) {
+        sensorOrientation =
+            chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: sensorOrientation
+        isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+        exposureRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+        maxFocusDiopter = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
+        awbOffSupported = chars.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)
+            ?.contains(CameraMetadata.CONTROL_AWB_MODE_OFF) == true
+        aeOffSupported = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES)
+            ?.contains(CameraMetadata.CONTROL_AE_MODE_OFF) == true
     }
 
     private fun streamMap(): StreamConfigurationMap {
@@ -197,6 +290,92 @@ class CameraEngine(
 
     private fun getOutputSizesFor(d: CameraDevice, klass: Class<SurfaceTexture>): Array<Size> =
         streamMap().getOutputSizes(klass)
+
+    private fun buildCaptureRequest(
+        template: Int,
+        targets: List<Surface>
+    ): CaptureRequest.Builder {
+        val d = device ?: throw IllegalStateException("Camera not open")
+        val b = d.createCaptureRequest(template)
+        for (s in targets) b.addTarget(s)
+        if (manualMode && aeOffSupported) {
+            b.set(
+                CaptureRequest.CONTROL_MODE,
+                CameraMetadata.CONTROL_MODE_OFF
+            )
+            b.set(
+                CaptureRequest.CONTROL_AE_MODE,
+                CameraMetadata.CONTROL_AE_MODE_OFF
+            )
+            isoRange?.let { r ->
+                val iso = (manualIso ?: ((r.lower + r.upper) / 2)).coerceIn(r.lower, r.upper)
+                b.set(CaptureRequest.SENSOR_SENSITIVITY, iso)
+            }
+            exposureRange?.let { r ->
+                var ns = manualShutterNs ?: 16_666_667L
+                // Recording constrains exposure to at most ~1/30s for stable fps.
+                if (activeWithRecorder && ns > 33_000_000L) ns = 33_000_000L
+                b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, ns.coerceIn(r.lower, r.upper))
+            }
+            manualFocusD?.let { fd ->
+                b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+                b.set(CaptureRequest.LENS_FOCUS_DISTANCE, fd)
+            }
+            if (awbOffSupported) {
+                b.set(
+                    CaptureRequest.CONTROL_AWB_MODE,
+                    CameraMetadata.CONTROL_AWB_MODE_OFF
+                )
+                val cct = manualWbTemp ?: 5500
+                b.set(CaptureRequest.COLOR_CORRECTION_GAINS, cctToGains(cct))
+            }
+        } else {
+            b.set(
+                CaptureRequest.CONTROL_AF_MODE,
+                if (activeWithRecorder)
+                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+                else
+                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+            )
+        }
+        return b
+    }
+
+    // Crude empirical CCT→channel-gain mapping: warm at low K, cool at high K.
+    private fun cctToGains(cct: Int): RggbChannelVector {
+        val r = when {
+            cct < 3000 -> 1.8f
+            cct < 5000 -> 1.3f
+            cct < 7000 -> 1.0f
+            else -> 0.75f
+        }
+        val b = when {
+            cct < 3000 -> 0.9f
+            cct < 5000 -> 1.1f
+            cct < 7000 -> 1.4f
+            else -> 1.7f
+        }
+        val g = 1.0f
+        return RggbChannelVector(r, g, g, b)
+    }
+
+    private fun refreshRepeatingRequest() {
+        val h = handler ?: return
+        h.post {
+            synchronized(lock) {
+                val s = session
+                val targets = activeTargets
+                if (s == null || targets == null) return@post
+                try {
+                    s.setRepeatingRequest(
+                        buildCaptureRequest(activeTemplate, targets).build(), null, h
+                    )
+                } catch (e: Exception) {
+                    onStatus("Request refresh failed: ${e.localizedMessage}")
+                }
+            }
+        }
+    }
 
     private fun buildSession(withRecorder: Boolean) {
         val d = device
@@ -227,36 +406,38 @@ class CameraEngine(
             recSurf?.let { outputs.add(it) }
         }
 
+        synchronized(lock) {
+            activeTemplate =
+                if (withRecorder && isRecording) CameraDevice.TEMPLATE_RECORD
+                else CameraDevice.TEMPLATE_PREVIEW
+            activeTargets = outputs.toList()
+            activeWithRecorder = withRecorder && isRecording
+        }
+
+        val recording = activeWithRecorder
         val h = handler
         if (h == null) return
         try {
             d.createCaptureSession(outputs, object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     synchronized(lock) { session = s }
-                    val template =
-                        if (withRecorder && isRecording) CameraDevice.TEMPLATE_RECORD
-                        else CameraDevice.TEMPLATE_PREVIEW
-                    val req = d.createCaptureRequest(template)
-                        .apply {
-                            addTarget(surface)
-                            if (withRecorder && isRecording) recSurf?.let { addTarget(it) }
-                            set(
-                                CaptureRequest.CONTROL_AF_MODE,
-                                if (withRecorder && isRecording)
-                                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
-                                else
-                                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-                            )
-                        }
-                    s.setRepeatingRequest(req.build(), null, h)
-                    if (withRecorder && isRecording) {
+                    try {
+                        val req = buildCaptureRequest(
+                            if (recording) CameraDevice.TEMPLATE_RECORD
+                            else CameraDevice.TEMPLATE_PREVIEW,
+                            outputs
+                        )
+                        s.setRepeatingRequest(req.build(), null, h)
+                    } catch (e: Exception) {
+                        onStatus("Request failed: ${e.localizedMessage}")
+                    }
+                    if (recording) {
                         recorder?.start()
                         onStatus("REC — recording…")
-                        applyTransform(t, size, displayRotationDegrees())
                     } else {
                         onStatus("Ready — ${size.width}x${size.height}")
-                        applyTransform(t, size, displayRotationDegrees())
                     }
+                    applyTransform(t, size, displayRotationDegrees())
                 }
                 override fun onConfigureFailed(s: CameraCaptureSession) {
                     onStatus("Session configuration failed")
@@ -367,12 +548,11 @@ class CameraEngine(
 
     private fun pickVideoSize(): Size {
         val sizes = streamMap().getOutputSizes(MediaRecorder::class.java)
-        val target = 16.0 / 9.0
         var best: Size? = null
         var bestArea = 0
         for (s in sizes) {
             val ratio = maxOf(s.width, s.height).toDouble() /
-                minOf(s.width, s.height).coerceAtLeast(1)
+                minOf(s.width, s.height).coerceAtLeast(1).toDouble()
             if (ratio < 1.70 || ratio > 1.86) continue
             val area = s.width * s.height
             // M1 default: keep to 1080p-class; 4K comes with the quality milestone.
